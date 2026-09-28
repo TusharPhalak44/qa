@@ -1,5 +1,7 @@
 import { Storage } from '@google-cloud/storage';
 import crypto from 'crypto';
+import path from 'path';
+import fs from 'fs';
 
 // Supported audio MIME types and their standard extensions
 export const ALLOWED_AUDIO_TYPES: Record<string, string> = {
@@ -22,34 +24,83 @@ export const MAX_AUDIO_FILE_SIZE_BYTES = 100 * 1024 * 1024; // 100 MB (ample for
 
 let storageClientSingleton: Storage | null = null;
 
+export function loadGoogleCredentials(): { credentials?: any; keyFilename?: string; projectId?: string } {
+  const options: { credentials?: any; keyFilename?: string; projectId?: string } = {};
+
+  const projectId = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
+  if (projectId) {
+    options.projectId = projectId;
+  }
+
+  // 1. Direct JSON string in environment variable (recommended for Vercel)
+  const directJson = process.env.GOOGLE_CLOUD_CREDENTIALS_JSON || process.env.GCP_CREDENTIALS_JSON;
+  if (directJson && directJson.trim().startsWith('{')) {
+    try {
+      options.credentials = JSON.parse(directJson.trim());
+      if (options.credentials.project_id && !options.projectId) {
+        options.projectId = options.credentials.project_id;
+      }
+      return options;
+    } catch (err) {
+      console.error('Failed to parse GOOGLE_CLOUD_CREDENTIALS_JSON:', err);
+    }
+  }
+
+  // 2. File path or JSON in GOOGLE_APPLICATION_CREDENTIALS
+  const envPath = process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim();
+  if (envPath) {
+    if (envPath.startsWith('{')) {
+      try {
+        options.credentials = JSON.parse(envPath);
+        if (options.credentials.project_id && !options.projectId) {
+          options.projectId = options.credentials.project_id;
+        }
+        return options;
+      } catch (err) {
+        console.error('Failed to parse JSON in GOOGLE_APPLICATION_CREDENTIALS:', err);
+      }
+    } else {
+      const resolvedPath = path.isAbsolute(envPath)
+        ? envPath
+        : path.resolve(/*turbopackIgnore: true*/ process.cwd(), envPath);
+      if (fs.existsSync(resolvedPath)) {
+        try {
+          options.credentials = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
+          if (options.credentials.project_id && !options.projectId) {
+            options.projectId = options.credentials.project_id;
+          }
+          return options;
+        } catch (err) {
+          options.keyFilename = resolvedPath;
+          return options;
+        }
+      }
+    }
+  }
+
+  // 3. Automatic fallback to google-credentials.json in workspace root
+  const defaultKeyPath = path.resolve(/*turbopackIgnore: true*/ process.cwd(), 'google-credentials.json');
+  if (fs.existsSync(defaultKeyPath)) {
+    try {
+      options.credentials = JSON.parse(fs.readFileSync(defaultKeyPath, 'utf8'));
+      if (options.credentials.project_id && !options.projectId) {
+        options.projectId = options.credentials.project_id;
+      }
+      return options;
+    } catch (err) {
+      console.warn('Found google-credentials.json in root but could not parse it:', err);
+    }
+  }
+
+  return options;
+}
+
 export function getStorageClient(): Storage {
   if (storageClientSingleton) {
     return storageClientSingleton;
   }
 
-  const storageOptions: Record<string, unknown> = {};
-
-  const projectId = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
-  if (projectId) {
-    storageOptions.projectId = projectId;
-  }
-
-  // Support credentials via GOOGLE_APPLICATION_CREDENTIALS (file path or JSON string)
-  // or GOOGLE_CLOUD_CREDENTIALS_JSON (direct raw JSON in Vercel environment variables)
-  const credsJson = process.env.GOOGLE_CLOUD_CREDENTIALS_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS;
-  if (credsJson) {
-    const trimmed = credsJson.trim();
-    if (trimmed.startsWith('{')) {
-      try {
-        storageOptions.credentials = JSON.parse(trimmed);
-      } catch (err) {
-        console.error('Failed to parse Google credentials JSON:', err);
-      }
-    } else {
-      storageOptions.keyFilename = trimmed;
-    }
-  }
-
+  const storageOptions = loadGoogleCredentials();
   storageClientSingleton = new Storage(storageOptions);
   return storageClientSingleton;
 }

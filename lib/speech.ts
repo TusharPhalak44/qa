@@ -1,4 +1,5 @@
 import { SpeechClient } from '@google-cloud/speech';
+import { loadGoogleCredentials } from './gcs';
 
 let speechClientSingleton: SpeechClient | null = null;
 
@@ -7,27 +8,7 @@ export function getSpeechClient(): SpeechClient {
     return speechClientSingleton;
   }
 
-  const speechOptions: Record<string, any> = {};
-
-  const projectId = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
-  if (projectId) {
-    speechOptions.projectId = projectId;
-  }
-
-  const credsJson = process.env.GOOGLE_CLOUD_CREDENTIALS_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS;
-  if (credsJson) {
-    const trimmed = credsJson.trim();
-    if (trimmed.startsWith('{')) {
-      try {
-        speechOptions.credentials = JSON.parse(trimmed);
-      } catch (err) {
-        console.error('Failed to parse SpeechClient credentials JSON:', err);
-      }
-    } else {
-      speechOptions.keyFilename = trimmed;
-    }
-  }
-
+  const speechOptions = loadGoogleCredentials();
   speechClientSingleton = new SpeechClient(speechOptions);
   return speechClientSingleton;
 }
