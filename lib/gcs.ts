@@ -24,7 +24,31 @@ export const MAX_AUDIO_FILE_SIZE_BYTES = 100 * 1024 * 1024; // 100 MB (ample for
 
 let storageClientSingleton: Storage | null = null;
 
+function syncLocalEnv(): void {
+  if (process.env.NODE_ENV === 'production') return;
+  try {
+    const envPath = path.resolve(/*turbopackIgnore: true*/ process.cwd(), '.env.local');
+    if (fs.existsSync(envPath)) {
+      const content = fs.readFileSync(envPath, 'utf8');
+      for (const line of content.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed && !trimmed.startsWith('#') && trimmed.includes('=')) {
+          const idx = trimmed.indexOf('=');
+          const k = trimmed.slice(0, idx).trim();
+          const v = trimmed.slice(idx + 1).trim();
+          if (v) {
+            process.env[k] = v;
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore error
+  }
+}
+
 export function loadGoogleCredentials(): { credentials?: any; keyFilename?: string; projectId?: string } {
+  syncLocalEnv();
   const options: { credentials?: any; keyFilename?: string; projectId?: string } = {};
 
   const projectId = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
@@ -106,6 +130,7 @@ export function getStorageClient(): Storage {
 }
 
 export function getGCSBucketName(): string {
+  syncLocalEnv();
   const bucketName = process.env.GCS_BUCKET_NAME?.trim();
   if (!bucketName) {
     throw new Error(
