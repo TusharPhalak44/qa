@@ -59,6 +59,7 @@ export interface QACheckpoints {
 }
 
 export interface TranscriptRecord {
+  id?: string;
   recordingPath?: string;
   transcriptionProvider: string;
   transcriptionStatus: WorkflowStatus;

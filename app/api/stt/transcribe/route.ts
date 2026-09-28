@@ -527,90 +527,57 @@ async function transcribeWithAssemblyAI(buffer: Buffer, apiKey: string): Promise
 
 export async function POST(request: NextRequest) {
   try {
-    const formData = await request.formData();
-    const file = formData.get('file') as File | null;
-    const configStr = formData.get('sttConfig') as string | null;
+    const contentType = request.headers.get('content-type') || '';
 
-    if (!file || file.size === 0) {
-      return NextResponse.json({ error: 'Audio file is required for API 1 transcription.' }, { status: 400 });
-    }
-
-    let sttConfig: STTConfig = {
-      provider: 'GoogleCloud',
-      apiKey: process.env.STT_API_KEY || process.env.GOOGLE_SPEECH_API_KEY || '',
-      gcsBucket: process.env.GCS_BUCKET_NAME || '',
-      language: 'en-US'
-    };
-
-    if (configStr) {
-      try {
-        const parsed = JSON.parse(configStr);
-        if (parsed.apiKey) sttConfig.apiKey = parsed.apiKey;
-        if (parsed.provider) sttConfig.provider = parsed.provider;
-        if (parsed.gcsBucket) sttConfig.gcsBucket = parsed.gcsBucket;
-        if (parsed.language) sttConfig.language = parsed.language;
-      } catch (e) {
-        console.warn('Failed to parse sttConfig, fallback to defaults');
-      }
-    }
-
-    const isGeminiProvider = sttConfig.provider === 'Gemini' || sttConfig.provider === 'GoogleGemini';
-    const effectiveApiKey = isGeminiProvider
-      ? (sttConfig.apiKey || process.env.GEMINI_API_KEY || '')
-      : (sttConfig.apiKey || process.env.STT_API_KEY || process.env.GOOGLE_SPEECH_API_KEY || process.env.GEMINI_API_KEY || '');
-
-    if (!effectiveApiKey) {
+    // Check if client tried to send multipart audio file through Vercel Function
+    if (contentType.includes('multipart/form-data')) {
       return NextResponse.json(
-        { error: 'API 1 Key Missing. Please enter your API Key in Transcription API Settings (API 1).' },
+        {
+          success: false,
+          error:
+            'Direct audio-file uploads through Vercel API routes are disabled to prevent HTTP 413 FUNCTION_PAYLOAD_TOO_LARGE errors. Please use the direct browser-to-GCS upload flow: request a signed URL via /api/stt/upload-url, upload to GCS, and submit the objectName to /api/stt/start.',
+        },
         { status: 400 }
       );
     }
 
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+    const body = await request.json();
+    const { objectName, language, fileName } = body;
 
-    let rawTranscript = '';
-    let actualProviderUsed = sttConfig.provider;
-
-    if (sttConfig.provider === 'AssemblyAI') {
-      rawTranscript = await transcribeWithAssemblyAI(buffer, effectiveApiKey);
-    } else if (isGeminiProvider) {
-      rawTranscript = await transcribeWithGeminiAudio(buffer, file.name, effectiveApiKey);
-      actualProviderUsed = 'Gemini Multimodal STT';
-    } else {
-      // Default: Google Cloud Speech-to-Text with automatic Gemini fallback
-      try {
-        rawTranscript = await transcribeWithGoogleCloud(
-          buffer,
-          file.name,
-          effectiveApiKey,
-          sttConfig.gcsBucket,
-          sttConfig.language
-        );
-        if (!rawTranscript || rawTranscript.trim() === '' || rawTranscript.includes('No speech recognized')) {
-          throw new Error('Google Cloud Speech returned no speech for this audio format.');
-        }
-      } catch (googleErr: any) {
-        const geminiKey = process.env.GEMINI_API_KEY || (effectiveApiKey.startsWith('AQ') ? effectiveApiKey : '');
-        if (geminiKey) {
-          console.warn('Google Cloud Speech encountered an issue, falling back to Gemini Multimodal Audio STT:', googleErr.message);
-          rawTranscript = await transcribeWithGeminiAudio(buffer, file.name, geminiKey);
-          actualProviderUsed = 'Gemini Multimodal STT (High Precision)';
-        } else {
-          throw googleErr;
-        }
-      }
+    if (!objectName) {
+      return NextResponse.json(
+        {
+          success: false,
+          error:
+            'Missing "objectName". Please upload audio directly to GCS using a signed URL and provide the object identifier.',
+        },
+        { status: 400 }
+      );
     }
+
+    // Dynamic import to prevent circular or unnecessary early loading
+    const { validateGCSObject } = await import('@/lib/gcs');
+    const { startAsyncRecognition } = await import('@/lib/speech');
+
+    // Validate uploaded GCS object
+    const validated = await validateGCSObject(objectName);
+
+    // Start asynchronous recognition
+    const operationName = await startAsyncRecognition({
+      gcsUri: validated.gcsUri,
+      contentType: validated.contentType,
+      originalFileName: fileName || objectName,
+      language: language || 'en-US',
+    });
 
     return NextResponse.json({
       success: true,
-      transcriptionStatus: 'transcription_completed',
-      rawTranscript,
-      transcriptionProvider: actualProviderUsed,
-      filename: file.name,
-      processedAt: new Date().toISOString()
+      operationName,
+      objectName: validated.objectName,
+      gcsUri: validated.gcsUri,
+      fileSize: validated.size,
+      message: 'Asynchronous Speech-to-Text operation started. Poll /api/stt/status for results.',
     });
-
   } catch (error) {
     console.error('API 1 Transcription Error:', error);
     const details = error instanceof Error ? error.message : 'Unknown error';
@@ -619,9 +586,10 @@ export async function POST(request: NextRequest) {
         success: false,
         transcriptionStatus: 'error',
         error: details,
-        details
+        details,
       },
       { status: 400 }
     );
   }
 }
+

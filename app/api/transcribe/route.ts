@@ -473,17 +473,15 @@ export async function POST(request: NextRequest) {
     const settings: RequestSettings = JSON.parse(settingsStr);
     let rawTranscript = rawTranscriptInput || '';
 
-    // If an audio file is uploaded, perform STT transcription first
+    // Prevent direct audio file uploads through Vercel Functions (413 Payload Too Large)
     if (file && file.size > 0) {
-      try {
-        rawTranscript = await transcribeAudio(file);
-      } catch (sttError) {
-        console.error('STT Error:', sttError);
-        return NextResponse.json(
-          { error: sttError instanceof Error ? sttError.message : 'Audio transcription failed' },
-          { status: 500 }
-        );
-      }
+      return NextResponse.json(
+        {
+          error:
+            'Direct audio-file uploads through Vercel API routes are disabled to prevent HTTP 413 FUNCTION_PAYLOAD_TOO_LARGE. Please upload audio directly to Google Cloud Storage using signed URLs (/api/stt/upload-url) or provide rawTranscript text.',
+        },
+        { status: 400 }
+      );
     }
 
     if (!rawTranscript) {

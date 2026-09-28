@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import { CAMPAIGN_ASSETS, DEFAULT_CAMPAIGNS } from '@/lib/campaigns';
-import { STTConfig, AIConfig, LeadInfo, CampaignInfo, WorkflowStatus } from '@/lib/types';
+import { STTConfig, AIConfig, LeadInfo, CampaignInfo, WorkflowStatus, TranscriptRecord } from '@/lib/types';
 import { DEFAULT_AI_PROMPT_TEMPLATE } from '@/lib/defaultPrompt';
 
 const SAMPLE_PROSPECTS = {
@@ -75,13 +75,46 @@ export default function Home() {
   const [activeSettingsTab, setActiveSettingsTab] = useState<'stt' | 'ai'>('stt');
   const [sttTestStatus, setSttTestStatus] = useState<{ loading: boolean; message: string; isError?: boolean } | null>(null);
   const [aiTestStatus, setAiTestStatus] = useState<{ loading: boolean; message: string; isError?: boolean } | null>(null);
+  const [corsStatus, setCorsStatus] = useState<{ loading: boolean; message: string; isError?: boolean } | null>(null);
 
   // Workflow Pipeline State
   const [file, setFile] = useState<File | null>(null);
   const [workflowStatus, setWorkflowStatus] = useState<WorkflowStatus>('idle');
+  const [isUploading, setIsUploading] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [isAiProcessing, setIsAiProcessing] = useState(false);
   const [activeResultsTab, setActiveResultsTab] = useState<'modified' | 'qa' | 'raw'>('modified');
+
+  // Direct GCS Upload & Async Recognition Progress Tracking
+  const [uploadProgress, setUploadProgress] = useState<{
+    percent: number;
+    loadedBytes: number;
+    totalBytes: number;
+    statusText: string;
+  } | null>(null);
+  const [transcriptionProgress, setTranscriptionProgress] = useState<{
+    percent: number;
+    statusText: string;
+  } | null>(null);
+  const [uploadedGcsObject, setUploadedGcsObject] = useState<{
+    objectName: string;
+    gcsUri: string;
+    fileName: string;
+  } | null>(null);
+
+  // Error & Retry State
+  const [pipelineError, setPipelineError] = useState<{
+    step: 'upload' | 'transcribe' | 'ai' | 'general';
+    message: string;
+    details?: string;
+    isCorsError?: boolean;
+    retryAction?: () => void;
+  } | null>(null);
+
+  // Database Records State
+  const [showRecordsModal, setShowRecordsModal] = useState(false);
+  const [savedRecords, setSavedRecords] = useState<(TranscriptRecord & { id: string })[]>([]);
+  const [isLoadingRecords, setIsLoadingRecords] = useState(false);
 
   // Stored Data (Never overwrite rawTranscript with modifiedTranscript)
   const [rawTranscript, setRawTranscript] = useState<string>('');
@@ -102,7 +135,23 @@ export default function Home() {
     processingNotes?: string;
   } | null>(null);
 
-  // Load saved API configs & prompt on mount
+  // Fetch saved records from database
+  const loadSavedRecords = async () => {
+    setIsLoadingRecords(true);
+    try {
+      const res = await fetch('/api/records?limit=50');
+      const data = await res.json();
+      if (data.success && data.records) {
+        setSavedRecords(data.records);
+      }
+    } catch (err) {
+      console.warn('Could not load records from database:', err);
+    } finally {
+      setIsLoadingRecords(false);
+    }
+  };
+
+  // Load saved API configs, prompt, and database records on mount
   useEffect(() => {
     const savedSttBucket = localStorage.getItem('gcs_bucket_name');
     const savedSttKey = localStorage.getItem('stt_api_key');
@@ -126,7 +175,80 @@ export default function Home() {
     } else {
       setCustomPrompt(DEFAULT_AI_PROMPT_TEMPLATE);
     }
+
+    // Load persisted records from Database
+    loadSavedRecords();
   }, []);
+
+  // 1-Click Configure GCS Bucket CORS
+  const handleConfigureCors = async () => {
+    setCorsStatus({ loading: true, message: 'Applying GCS CORS configuration for localhost and *.vercel.app...' });
+    try {
+      const res = await fetch('/api/stt/cors', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setCorsStatus({
+          loading: false,
+          message: 'GCS CORS successfully configured for localhost:3000, localhost:8080, and *.vercel.app!',
+          isError: false,
+        });
+        if (pipelineError?.isCorsError) {
+          setPipelineError(null);
+        }
+      } else {
+        setCorsStatus({
+          loading: false,
+          message: `Failed to configure CORS: ${data.error}`,
+          isError: true,
+        });
+      }
+    } catch (err) {
+      setCorsStatus({
+        loading: false,
+        message: `CORS configuration error: ${err instanceof Error ? err.message : 'Network error'}`,
+        isError: true,
+      });
+    }
+  };
+
+  // Load a saved record into the active workspace editor
+  const handleLoadRecordIntoEditor = (rec: TranscriptRecord) => {
+    setLeadInfo(rec.leadInfo);
+    setCampaignInfo(rec.campaignInfo);
+    setRawTranscript(rec.rawTranscript);
+    setModifiedTranscript(rec.modifiedTranscript);
+    setEditedModifiedTranscript(rec.modifiedTranscript);
+    setQaData({
+      status: rec.aiProcessingStatus === 'ai_processing_completed' ? 'success' : 'review_required',
+      qualification: {
+        implementation_question_asked: Boolean(rec.qaCheckpoints?.implementation_question_asked),
+        implementation_response: rec.implementationResponse,
+        implementation_timeline: rec.implementationTimeline,
+      },
+      checkpoints: rec.qaCheckpoints as any,
+      missingInformation: rec.missingInformation,
+      processingNotes: rec.processingNotes,
+    });
+    setWorkflowStatus(rec.aiProcessingStatus);
+    setActiveResultsTab('modified');
+    setShowRecordsModal(false);
+  };
+
+  // Delete record from database
+  const handleDeleteRecord = async (id?: string) => {
+    if (!id) return;
+    if (!confirm('Are you sure you want to delete this transcript record from the database?')) return;
+    try {
+      await fetch(`/api/records?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+      setSavedRecords(prev => prev.filter(r => r.id !== id));
+    } catch (err) {
+      alert(`Failed to delete record: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
+  };
 
   // Update Campaign fields when selection changes
   const handleAssetChange = (assetId: string) => {
@@ -272,6 +394,170 @@ export default function Home() {
     setShowSettingsModal(false);
   };
 
+  // DIRECT BROWSER-TO-GCS UPLOAD VIA SIGNED URL (0 Audio Bytes Flow through Vercel)
+  const uploadFileDirectlyToGcs = async (fileToUpload: File): Promise<{ objectName: string; gcsUri: string }> => {
+    setIsUploading(true);
+    setWorkflowStatus('uploading');
+    setPipelineError(null);
+    setUploadProgress({
+      percent: 0,
+      loadedBytes: 0,
+      totalBytes: fileToUpload.size,
+      statusText: 'Requesting secure short-lived signed URL...',
+    });
+
+    // Step 1: Request signed URL from backend (sends only metadata, no audio bytes!)
+    const urlRes = await fetch('/api/stt/upload-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: fileToUpload.name,
+        fileType: fileToUpload.type || (fileToUpload.name.toLowerCase().endsWith('.mp3') ? 'audio/mpeg' : 'audio/wav'),
+        fileSize: fileToUpload.size,
+      }),
+    });
+
+    const urlData = await urlRes.json();
+    if (!urlRes.ok || !urlData.success) {
+      throw new Error(urlData.error || 'Failed to generate secure GCS upload URL.');
+    }
+
+    const { uploadUrl, objectName, gcsUri, contentType } = urlData;
+
+    // Step 2: Direct browser-to-GCS upload via XMLHttpRequest (provides accurate real-time progress)
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', uploadUrl, true);
+      xhr.setRequestHeader('Content-Type', contentType || fileToUpload.type || 'audio/wav');
+
+      xhr.upload.onprogress = (evt) => {
+        if (evt.lengthComputable) {
+          const percent = Math.round((evt.loaded / evt.total) * 100);
+          const loadedMb = (evt.loaded / (1024 * 1024)).toFixed(1);
+          const totalMb = (evt.total / (1024 * 1024)).toFixed(1);
+          setUploadProgress({
+            percent,
+            loadedBytes: evt.loaded,
+            totalBytes: evt.total,
+            statusText: `Uploading directly to GCS: ${percent}% (${loadedMb} MB / ${totalMb} MB)`,
+          });
+        }
+      };
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          setUploadProgress({
+            percent: 100,
+            loadedBytes: fileToUpload.size,
+            totalBytes: fileToUpload.size,
+            statusText: 'Direct upload to Google Cloud Storage complete!',
+          });
+          const uploadedObj = { objectName, gcsUri, fileName: fileToUpload.name };
+          setUploadedGcsObject(uploadedObj);
+          setIsUploading(false);
+          resolve(uploadedObj);
+        } else {
+          setIsUploading(false);
+          const isCors = xhr.status === 0 || xhr.status === 403;
+          reject(
+            new Error(
+              `GCS Upload failed (HTTP ${xhr.status}): ${xhr.statusText || (isCors ? 'Possible CORS restriction on your GCS bucket. Click "Configure GCS CORS" below.' : 'Upload rejected by Google Cloud Storage')}`
+            )
+          );
+        }
+      };
+
+      xhr.onerror = () => {
+        setIsUploading(false);
+        reject(
+          new Error(
+            'Direct GCS upload failed. This is typically due to GCS CORS policy restricting requests from this origin. Click "Configure GCS CORS" below to apply the configuration.'
+          )
+        );
+      };
+
+      xhr.onabort = () => {
+        setIsUploading(false);
+        reject(new Error('GCS upload was cancelled.'));
+      };
+
+      xhr.send(fileToUpload);
+    });
+  };
+
+  // ASYNCHRONOUS SPEECH-TO-TEXT WITH OPERATION POLLING (No Long-Running Vercel Function)
+  const runSpeechToText = async (objectName: string, fileName: string): Promise<string> => {
+    setIsTranscribing(true);
+    setWorkflowStatus('transcription_processing');
+    setPipelineError(null);
+    setTranscriptionProgress({
+      percent: 5,
+      statusText: 'Starting Google Cloud Speech-to-Text asynchronous operation...',
+    });
+
+    // Step 1: Start async recognition using verified GCS URI
+    const startRes = await fetch('/api/stt/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        objectName,
+        fileName,
+        language: sttConfig.language || 'en-US',
+      }),
+    });
+
+    const startData = await startRes.json();
+    if (!startRes.ok || !startData.success) {
+      throw new Error(startData.error || 'Failed to start Speech-to-Text recognition.');
+    }
+
+    const operationName = startData.operationName;
+    setTranscriptionProgress({
+      percent: 15,
+      statusText: 'Speech recognition in progress. Polling status...',
+    });
+
+    // Step 2: Poll operation status every 2.5s without holding Vercel Function open
+    const maxPollAttempts = 120; // 5 minutes max
+    let attempts = 0;
+
+    while (attempts < maxPollAttempts) {
+      await new Promise((r) => setTimeout(r, 2500));
+      attempts++;
+
+      const pollRes = await fetch(
+        `/api/stt/status?operationName=${encodeURIComponent(operationName)}&objectName=${encodeURIComponent(objectName)}`
+      );
+      const pollData = await pollRes.json();
+
+      if (!pollRes.ok || pollData.error) {
+        throw new Error(pollData.error || 'Speech-to-Text operation failed.');
+      }
+
+      if (!pollData.done) {
+        const pct = Math.max(15, Math.min(95, pollData.progressPercent || Math.round((attempts / 60) * 85)));
+        setTranscriptionProgress({
+          percent: pct,
+          statusText: `Transcribing audio with Speech-to-Text (${pct}% complete)...`,
+        });
+        continue;
+      }
+
+      // Completed successfully
+      setTranscriptionProgress({
+        percent: 100,
+        statusText: 'Speech-to-Text completed!',
+      });
+      setRawTranscript(pollData.rawTranscript);
+      setWorkflowStatus('transcription_completed');
+      setActiveResultsTab('raw');
+      setIsTranscribing(false);
+      return pollData.rawTranscript;
+    }
+
+    throw new Error('Speech-to-Text operation timed out after 5 minutes.');
+  };
+
   // STEP 1: API 1 — Transcribe Audio Recording -> raw_transcript ONLY
   const handleRunTranscriptionOnly = async () => {
     if (!file) {
@@ -279,36 +565,30 @@ export default function Home() {
       return;
     }
 
-    setIsTranscribing(true);
-    setWorkflowStatus('transcription_processing');
-
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('sttConfig', JSON.stringify(sttConfig));
+    setPipelineError(null);
 
     try {
-      const res = await fetch('/api/stt/transcribe', {
-        method: 'POST',
-        body: formData
-      });
-
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        throw new Error(data.error || data.details || 'Transcription failed');
-      }
-
-      setRawTranscript(data.rawTranscript);
-      setWorkflowStatus('transcription_completed');
-      setActiveResultsTab('raw');
+      // 1. Direct browser-to-GCS upload
+      const uploaded = await uploadFileDirectlyToGcs(file);
+      // 2. Asynchronous Speech-to-Text with polling
+      await runSpeechToText(uploaded.objectName, file.name);
     } catch (err) {
+      const errMsg = err instanceof Error ? err.message : 'Transcription failed';
+      const isCors = errMsg.toLowerCase().includes('cors');
       setWorkflowStatus('error');
-      alert(`API 1 Error: ${err instanceof Error ? err.message : 'Transcription failed'}`);
+      setPipelineError({
+        step: isUploading ? 'upload' : 'transcribe',
+        message: errMsg,
+        isCorsError: isCors,
+        retryAction: () => handleRunTranscriptionOnly(),
+      });
     } finally {
+      setIsUploading(false);
       setIsTranscribing(false);
     }
   };
 
-  // STEP 2: API 2 — Process raw_transcript with Gemini AI -> 3-4 Paragraphs + QA Results
+  // STEP 2: API 2 — Process raw_transcript with Gemini AI -> 3-4 Paragraphs + QA Results -> Save to Database
   const handleRunAiProcessingOnly = async (overrideRaw?: string) => {
     const targetRaw = overrideRaw || rawTranscript || pastedRawTranscript;
     if (!targetRaw.trim()) {
@@ -318,6 +598,7 @@ export default function Home() {
 
     setIsAiProcessing(true);
     setWorkflowStatus('ai_processing');
+    setPipelineError(null);
 
     try {
       const res = await fetch('/api/ai/edit', {
@@ -328,8 +609,8 @@ export default function Home() {
           leadInfo,
           campaignInfo,
           aiConfig,
-          customPrompt: customPrompt.trim()
-        })
+          customPrompt: customPrompt.trim(),
+        }),
       });
 
       const data = await res.json();
@@ -344,62 +625,93 @@ export default function Home() {
         qualification: data.qualification,
         checkpoints: data.checkpoints,
         missingInformation: data.missingInformation,
-        processingNotes: data.processingNotes
+        processingNotes: data.processingNotes,
       });
+
+      // DATABASE PERSISTENCE: Save full TranscriptRecord to Database
+      try {
+        const record: TranscriptRecord = {
+          recordingPath: uploadedGcsObject?.gcsUri || file?.name || 'manual-input',
+          transcriptionProvider: 'Google Cloud Speech-to-Text (GCS Direct Upload)',
+          transcriptionStatus: 'transcription_completed',
+          rawTranscript: targetRaw,
+          leadInfo,
+          campaignInfo,
+          aiProvider: data.aiProvider || aiConfig.provider,
+          aiModel: data.aiModel || aiConfig.model,
+          aiProcessingStatus: data.status === 'success' ? 'ai_processing_completed' : 'review_required',
+          modifiedTranscript: data.modifiedTranscript,
+          implementationResponse: data.qualification?.implementation_response || '',
+          implementationTimeline: data.qualification?.implementation_timeline || '',
+          qaCheckpoints: data.checkpoints || {},
+          missingInformation: data.missingInformation || [],
+          processingNotes: data.processingNotes || '',
+          processedAt: new Date().toISOString(),
+        };
+
+        await fetch('/api/records', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(record),
+        });
+        loadSavedRecords();
+      } catch (dbErr) {
+        console.warn('Failed to save record to database:', dbErr);
+      }
 
       setWorkflowStatus(data.status === 'success' ? 'ai_processing_completed' : 'review_required');
       setActiveResultsTab('modified');
     } catch (err) {
       setWorkflowStatus('error');
-      alert(`API 2 Error: ${err instanceof Error ? err.message : 'AI Processing failed'}`);
+      setPipelineError({
+        step: 'ai',
+        message: err instanceof Error ? err.message : 'AI Processing failed',
+        retryAction: () => handleRunAiProcessingOnly(overrideRaw),
+      });
     } finally {
       setIsAiProcessing(false);
     }
   };
 
-  // Combined One-Click Full Workflow (Step 1 -> Step 2)
+  // Combined One-Click Full Workflow (Direct GCS Upload → Speech-to-Text → Gemini AI → Database)
   const handleRunFullWorkflow = async () => {
     if (!file && !pastedRawTranscript.trim()) {
       alert('Please upload an audio file or paste a raw transcript.');
       return;
     }
 
+    setPipelineError(null);
     let activeRaw = pastedRawTranscript;
 
     if (file) {
-      setIsTranscribing(true);
-      setWorkflowStatus('transcription_processing');
-
-      const formData = new FormData();
-      formData.append('file', file);
-      formData.append('sttConfig', JSON.stringify(sttConfig));
-
       try {
-        const res = await fetch('/api/stt/transcribe', {
-          method: 'POST',
-          body: formData
-        });
-
-        const data = await res.json();
-        if (!res.ok || !data.success) {
-          throw new Error(data.error || data.details || 'Transcription failed');
-        }
-
-        activeRaw = data.rawTranscript;
-        setRawTranscript(data.rawTranscript);
-        setWorkflowStatus('transcription_completed');
+        // Step 1: Direct browser-to-GCS upload
+        const uploaded = await uploadFileDirectlyToGcs(file);
+        // Step 2: Asynchronous Speech-to-Text with polling
+        activeRaw = await runSpeechToText(uploaded.objectName, file.name);
       } catch (err) {
+        const errMsg = err instanceof Error ? err.message : 'Full pipeline failed';
+        const isCors = errMsg.toLowerCase().includes('cors');
         setWorkflowStatus('error');
-        alert(`API 1 Error: ${err instanceof Error ? err.message : 'Transcription failed'}`);
+        setPipelineError({
+          step: isUploading ? 'upload' : 'transcribe',
+          message: errMsg,
+          isCorsError: isCors,
+          retryAction: () => handleRunFullWorkflow(),
+        });
+        setIsUploading(false);
         setIsTranscribing(false);
         return;
       } finally {
+        setIsUploading(false);
         setIsTranscribing(false);
       }
     }
 
-    // Now run API 2 with the raw transcript
-    await handleRunAiProcessingOnly(activeRaw);
+    // Step 3 & 4: Process raw transcript with Gemini AI and persist to Database
+    if (activeRaw) {
+      await handleRunAiProcessingOnly(activeRaw);
+    }
   };
 
   const handleDownloadTranscript = () => {
@@ -438,16 +750,36 @@ export default function Home() {
             </p>
           </div>
 
-          <button
-            onClick={() => setShowSettingsModal(true)}
-            className="flex items-center gap-2 px-4 py-2 text-sm bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700 transition font-medium"
-          >
-            <svg className="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-            </svg>
-            API Configurations
-          </button>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => {
+                loadSavedRecords();
+                setShowRecordsModal(true);
+              }}
+              className="flex items-center gap-2 px-3.5 py-2 text-sm bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700 transition font-medium"
+            >
+              <svg className="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4" />
+              </svg>
+              Database Records
+              {savedRecords.length > 0 && (
+                <span className="px-1.5 py-0.2 text-[10px] font-bold rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                  {savedRecords.length}
+                </span>
+              )}
+            </button>
+
+            <button
+              onClick={() => setShowSettingsModal(true)}
+              className="flex items-center gap-2 px-4 py-2 text-sm bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700 transition font-medium"
+            >
+              <svg className="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+              </svg>
+              API Configurations
+            </button>
+          </div>
         </div>
       </header>
 
@@ -461,6 +793,10 @@ export default function Home() {
                 ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
                 : workflowStatus === 'transcription_completed'
                 ? 'bg-blue-500/10 text-blue-400 border-blue-500/30'
+                : workflowStatus === 'uploading'
+                ? 'bg-cyan-500/10 text-cyan-400 border-cyan-500/30 animate-pulse'
+                : workflowStatus === 'transcription_processing'
+                ? 'bg-indigo-500/10 text-indigo-400 border-indigo-500/30 animate-pulse'
                 : workflowStatus === 'review_required'
                 ? 'bg-amber-500/10 text-amber-400 border-amber-500/30'
                 : workflowStatus === 'error'
@@ -473,16 +809,134 @@ export default function Home() {
 
           <div className="flex items-center gap-3 text-xs">
             <div className="flex items-center gap-1.5">
+              <span className={`w-2 h-2 rounded-full ${uploadedGcsObject ? 'bg-cyan-400' : 'bg-slate-600'}`}></span>
+              <span className="text-slate-300">GCS Direct Upload</span>
+            </div>
+            <span className="text-slate-600">→</span>
+            <div className="flex items-center gap-1.5">
               <span className={`w-2 h-2 rounded-full ${rawTranscript ? 'bg-emerald-400' : 'bg-slate-600'}`}></span>
-              <span className="text-slate-300">API 1 (Raw Transcript)</span>
+              <span className="text-slate-300">Speech-to-Text</span>
             </div>
             <span className="text-slate-600">→</span>
             <div className="flex items-center gap-1.5">
               <span className={`w-2 h-2 rounded-full ${modifiedTranscript ? 'bg-emerald-400' : 'bg-slate-600'}`}></span>
-              <span className="text-slate-300">API 2 (AI Edited 4-Paragraph Transcript)</span>
+              <span className="text-slate-300">Gemini AI Editing</span>
+            </div>
+            <span className="text-slate-600">→</span>
+            <div className="flex items-center gap-1.5">
+              <span className={`w-2 h-2 rounded-full ${workflowStatus === 'ai_processing_completed' ? 'bg-emerald-400' : 'bg-slate-600'}`}></span>
+              <span className="text-slate-300">Database</span>
             </div>
           </div>
         </div>
+
+        {/* Dynamic Progress Indicator (Upload / Async Polling) */}
+        {(isUploading || isTranscribing || uploadProgress || transcriptionProgress) && (
+          <div className="mb-6 bg-slate-950/80 border border-indigo-500/30 rounded-xl p-4 shadow-xl space-y-3">
+            <div className="flex justify-between items-center text-xs">
+              <div className="flex items-center gap-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-indigo-400 animate-ping"></span>
+                <span className="font-semibold text-slate-200">
+                  {isUploading
+                    ? 'Direct Browser-to-GCS Upload (0 bytes through Vercel)'
+                    : isTranscribing
+                    ? 'Google Cloud Speech-to-Text (Asynchronous Operation)'
+                    : 'Processing Pipeline...'}
+                </span>
+              </div>
+              <span className="font-mono text-indigo-400 font-bold text-xs">
+                {isUploading
+                  ? `${uploadProgress?.percent || 0}%`
+                  : `${transcriptionProgress?.percent || 0}%`}
+              </span>
+            </div>
+
+            {/* Visual Progress Bar */}
+            <div className="w-full bg-slate-900 rounded-full h-2 overflow-hidden border border-slate-800">
+              <div
+                className="bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500 h-full transition-all duration-300 rounded-full"
+                style={{
+                  width: `${isUploading ? (uploadProgress?.percent || 0) : (transcriptionProgress?.percent || 0)}%`,
+                }}
+              ></div>
+            </div>
+
+            <p className="text-[11px] text-slate-400">
+              {isUploading ? uploadProgress?.statusText : transcriptionProgress?.statusText}
+            </p>
+          </div>
+        )}
+
+        {/* Pipeline Error Banner with Retry & 1-Click CORS Fix */}
+        {pipelineError && (
+          <div className="mb-6 bg-rose-950/40 border border-rose-800/80 rounded-xl p-4 shadow-lg flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+            <div className="flex items-start gap-3">
+              <div className="w-8 h-8 rounded-full bg-rose-500/20 border border-rose-500/30 flex items-center justify-center shrink-0 mt-0.5">
+                <svg className="w-4 h-4 text-rose-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                </svg>
+              </div>
+              <div>
+                <h4 className="text-xs font-bold text-rose-300">
+                  {pipelineError.step === 'upload'
+                    ? 'Direct GCS Upload Error'
+                    : pipelineError.step === 'transcribe'
+                    ? 'Speech-to-Text Error'
+                    : pipelineError.step === 'ai'
+                    ? 'Gemini AI Processing Error'
+                    : 'Pipeline Error'}
+                </h4>
+                <p className="text-xs text-rose-200/90 mt-0.5 leading-relaxed">
+                  {pipelineError.message}
+                </p>
+                {pipelineError.isCorsError && (
+                  <p className="text-[11px] text-rose-300/80 mt-1">
+                    Direct uploads require GCS bucket CORS to allow PUT/OPTIONS from your origin. Click below to apply.
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 self-end sm:self-center shrink-0">
+              {pipelineError.isCorsError && (
+                <button
+                  onClick={handleConfigureCors}
+                  disabled={corsStatus?.loading}
+                  className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold rounded-lg transition shadow flex items-center gap-1.5"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                  </svg>
+                  {corsStatus?.loading ? 'Applying CORS...' : 'Configure GCS CORS'}
+                </button>
+              )}
+
+              {pipelineError.retryAction && (
+                <button
+                  onClick={() => {
+                    const action = pipelineError.retryAction;
+                    setPipelineError(null);
+                    action?.();
+                  }}
+                  className="px-3 py-1.5 bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold rounded-lg transition shadow flex items-center gap-1.5"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  Retry
+                </button>
+              )}
+
+              <button
+                onClick={() => setPipelineError(null)}
+                className="p-1.5 text-slate-400 hover:text-slate-200 text-xs rounded transition"
+                title="Dismiss"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+        )}
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
           {/* Left Column: Form & Action Steps (5 Cols) */}
@@ -810,20 +1264,51 @@ export default function Home() {
               </div>
 
               {/* Upload Box */}
-              <div className="border-2 border-dashed border-slate-700 hover:border-indigo-500/60 rounded-xl p-3 text-center transition cursor-pointer bg-slate-900/50">
+              <div className="border-2 border-dashed border-slate-700 hover:border-indigo-500/60 rounded-xl p-4 text-center transition cursor-pointer bg-slate-900/50">
                 <input
                   type="file"
-                  accept="audio/*,video/*"
-                  onChange={(e) => setFile(e.target.files?.[0] || null)}
+                  accept="audio/wav,audio/mp3,audio/mpeg,audio/flac,audio/ogg,audio/m4a,.wav,.mp3,.flac,.ogg,.m4a"
+                  onChange={(e) => {
+                    const selected = e.target.files?.[0] || null;
+                    setFile(selected);
+                    setUploadedGcsObject(null);
+                    setPipelineError(null);
+                  }}
                   className="hidden"
                   id="audio-file-input"
                 />
                 <label htmlFor="audio-file-input" className="cursor-pointer block">
-                  <svg className="w-6 h-6 text-slate-400 mx-auto mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                  <svg className="w-7 h-7 text-indigo-400 mx-auto mb-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
                   </svg>
-                  <p className="text-xs text-slate-300 font-medium">
-                    {file ? file.name : 'Upload Audio File for API 1'}
+                  <p className="text-xs text-slate-200 font-semibold">
+                    {file ? file.name : 'Choose Audio Recording (WAV or MP3)'}
+                  </p>
+                  {file && (
+                    <div className="mt-2 flex flex-wrap items-center justify-center gap-1.5 text-[10px]">
+                      <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-mono">
+                        {(file.size / (1024 * 1024)).toFixed(2)} MB
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-medium">
+                        {file.name.toLowerCase().endsWith('.mp3')
+                          ? 'MP3 (Audio Layer 3)'
+                          : file.name.toLowerCase().endsWith('.wav')
+                          ? 'WAV (LINEAR16)'
+                          : file.name.split('.').pop()?.toUpperCase() || 'Audio'}
+                      </span>
+                      {file.size > 4.5 * 1024 * 1024 ? (
+                        <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-semibold">
+                          ⚡ Direct GCS Upload (&gt;4.5MB Safe)
+                        </span>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded bg-blue-500/20 text-blue-300 font-medium">
+                          Direct GCS Upload
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  <p className="text-[10px] text-slate-400 mt-1">
+                    Uploads directly to GCS via short-lived signed URL — 0 audio bytes through Vercel Functions
                   </p>
                 </label>
               </div>
@@ -842,27 +1327,41 @@ export default function Home() {
                 <div className="grid grid-cols-2 gap-2">
                   <button
                     onClick={handleRunTranscriptionOnly}
-                    disabled={isTranscribing || !file}
-                    className="py-2 px-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-1.5"
+                    disabled={isUploading || isTranscribing || !file}
+                    className="py-2.5 px-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-1.5 shadow"
                   >
-                    {isTranscribing ? 'API 1 Transcribing...' : '1. Transcribe Audio (API 1)'}
+                    {isUploading
+                      ? 'Uploading to GCS...'
+                      : isTranscribing
+                      ? 'Transcribing (STT)...'
+                      : '1. Transcribe Audio (Direct GCS)'}
                   </button>
 
                   <button
                     onClick={() => handleRunAiProcessingOnly()}
                     disabled={isAiProcessing || (!rawTranscript && !pastedRawTranscript.trim())}
-                    className="py-2 px-3 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-1.5"
+                    className="py-2.5 px-3 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-1.5 shadow"
                   >
-                    {isAiProcessing ? 'API 2 Processing...' : '2. AI Edit & QA (API 2)'}
+                    {isAiProcessing ? 'AI Processing...' : '2. AI Edit & QA (API 2)'}
                   </button>
                 </div>
 
                 <button
                   onClick={handleRunFullWorkflow}
-                  disabled={isTranscribing || isAiProcessing}
-                  className="w-full py-2.5 px-4 bg-gradient-to-r from-blue-600 via-indigo-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 text-white font-bold text-xs rounded-lg transition shadow-md disabled:opacity-50"
+                  disabled={isUploading || isTranscribing || isAiProcessing || (!file && !pastedRawTranscript.trim())}
+                  className="w-full py-2.5 px-4 bg-gradient-to-r from-blue-600 via-indigo-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 text-white font-bold text-xs rounded-lg transition shadow-md disabled:opacity-50 flex items-center justify-center gap-2"
                 >
-                  Run Full Pipeline (API 1 → API 2)
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  {isUploading
+                    ? '1/3 Direct Uploading to GCS...'
+                    : isTranscribing
+                    ? '2/3 Speech-to-Text Running...'
+                    : isAiProcessing
+                    ? '3/3 Gemini Editing & Saving to DB...'
+                    : 'Run Full Pipeline (GCS → STT → Gemini → Database)'}
                 </button>
 
                 {/* Instant Reprocess API 2 Button */}
@@ -1142,7 +1641,40 @@ export default function Home() {
                   </div>
                 )}
 
-                <div className="pt-2 flex justify-between">
+                {/* GCS Direct Upload & CORS Configuration */}
+                <div className="p-3.5 bg-slate-950/90 rounded-xl border border-slate-800 space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h4 className="font-semibold text-slate-200 text-xs">GCS Direct Upload &amp; Bucket CORS</h4>
+                      <p className="text-[11px] text-slate-400 mt-0.5">
+                        Permits secure direct browser-to-GCS uploads for localhost:3000, localhost:8080, and *.vercel.app
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleConfigureCors}
+                      disabled={corsStatus?.loading}
+                      className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold shadow transition disabled:opacity-50 shrink-0"
+                    >
+                      {corsStatus?.loading ? 'Applying...' : 'Configure Bucket CORS'}
+                    </button>
+                  </div>
+
+                  {corsStatus && (
+                    <div className={`p-2 rounded text-[11px] ${
+                      corsStatus.isError ? 'bg-rose-950/40 text-rose-300 border border-rose-800' : 'bg-emerald-950/40 text-emerald-300 border border-emerald-800'
+                    }`}>
+                      {corsStatus.message}
+                    </div>
+                  )}
+
+                  <div className="text-[10px] text-slate-500 space-y-0.5">
+                    <p>• Eliminates HTTP 413 (FUNCTION_PAYLOAD_TOO_LARGE) by uploading audio directly to GCS via short-lived signed URLs.</p>
+                    <p>• The bucket remains private. Service account keys and Gemini API keys are never exposed to the browser.</p>
+                  </div>
+                </div>
+
+                <div className="pt-2 flex justify-between items-center">
                   <button
                     onClick={handleTestSttConnection}
                     className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700 text-xs font-semibold"
@@ -1303,6 +1835,138 @@ export default function Home() {
                 className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold shadow-md"
               >
                 Save Configurations
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Database Records History Modal */}
+      {showRecordsModal && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-4xl max-h-[90vh] overflow-y-auto p-6 shadow-2xl space-y-6">
+            <div className="flex justify-between items-center border-b border-slate-800 pb-4">
+              <div>
+                <h3 className="text-base font-bold text-slate-100 flex items-center gap-2">
+                  <svg className="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4" />
+                  </svg>
+                  Persisted Database Records ({savedRecords.length})
+                </h3>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Complete call records automatically stored in database (Browser → GCS → STT → Gemini → Database)
+                </p>
+              </div>
+              <button
+                onClick={() => setShowRecordsModal(false)}
+                className="text-slate-400 hover:text-white text-lg font-bold p-1"
+              >
+                ✕
+              </button>
+            </div>
+
+            {isLoadingRecords ? (
+              <div className="py-16 text-center text-xs text-slate-400">Loading database records...</div>
+            ) : savedRecords.length === 0 ? (
+              <div className="py-16 text-center text-xs text-slate-500 space-y-2">
+                <p>No records saved in database yet.</p>
+                <p className="text-[11px] text-slate-600">
+                  When you run the pipeline (Step 1 → Step 2), records with raw transcript, AI modified transcript, lead data, and QA metrics are automatically saved here.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {savedRecords.map((rec) => {
+                  const leadName = `${rec.leadInfo.firstName || 'Prospect'} ${rec.leadInfo.lastName || ''}`.trim();
+                  return (
+                    <div
+                      key={rec.id}
+                      className="p-4 bg-slate-950/70 border border-slate-800 hover:border-slate-700 rounded-xl space-y-3 transition"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-900 pb-2">
+                        <div className="flex items-center gap-2.5">
+                          <span className="font-semibold text-slate-200 text-xs">{leadName}</span>
+                          <span className="text-[11px] text-slate-400 font-normal">
+                            ({rec.leadInfo.companyName || 'Unknown Co'})
+                          </span>
+                          <span className="text-[10px] text-indigo-400 bg-indigo-500/10 px-2 py-0.5 rounded border border-indigo-500/20">
+                            {rec.campaignInfo?.assetTitle || 'Campaign'}
+                          </span>
+                        </div>
+                        <span className="text-[10px] text-slate-500 font-mono">
+                          {rec.processedAt ? new Date(rec.processedAt).toLocaleString() : ''}
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-[11px]">
+                        <div>
+                          <span className="text-slate-500">Evaluation: </span>
+                          <span className="text-slate-300 font-medium">{rec.implementationResponse || 'N/A'}</span>
+                        </div>
+                        <div>
+                          <span className="text-slate-500">Timeline: </span>
+                          <span className="text-indigo-300 font-medium">{rec.implementationTimeline || 'N/A'}</span>
+                        </div>
+                        <div>
+                          <span className="text-slate-500">AI Model: </span>
+                          <span className="text-slate-300 font-mono text-[10px]">{rec.aiModel}</span>
+                        </div>
+                      </div>
+
+                      <p className="text-xs text-slate-300 line-clamp-2 italic bg-slate-900/50 p-2.5 rounded-lg border border-slate-900 font-sans">
+                        &ldquo;{rec.modifiedTranscript ? rec.modifiedTranscript.slice(0, 160) + '...' : 'No transcript text'}&rdquo;
+                      </p>
+
+                      <div className="flex justify-between items-center pt-1 text-xs">
+                        <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold uppercase tracking-wider ${
+                          rec.aiProcessingStatus === 'ai_processing_completed'
+                            ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                            : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+                        }`}>
+                          {rec.aiProcessingStatus.replace(/_/g, ' ')}
+                        </span>
+
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => handleLoadRecordIntoEditor(rec)}
+                            className="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded-md text-xs font-semibold shadow transition"
+                          >
+                            Load into Editor
+                          </button>
+                          <button
+                            onClick={() => {
+                              const blob = new Blob([rec.modifiedTranscript], { type: 'text/plain;charset=utf-8' });
+                              const url = URL.createObjectURL(blob);
+                              const a = document.createElement('a');
+                              a.href = url;
+                              a.download = `Transcript_${rec.leadInfo.firstName}_${rec.leadInfo.lastName}.txt`;
+                              a.click();
+                              URL.revokeObjectURL(url);
+                            }}
+                            className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-md text-xs transition border border-slate-700"
+                          >
+                            Export
+                          </button>
+                          <button
+                            onClick={() => handleDeleteRecord(rec.id)}
+                            className="px-2.5 py-1 bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 rounded-md text-xs transition border border-rose-800/40"
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            <div className="flex justify-end pt-4 border-t border-slate-800">
+              <button
+                onClick={() => setShowRecordsModal(false)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold"
+              >
+                Close
               </button>
             </div>
           </div>
